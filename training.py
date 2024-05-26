@@ -104,7 +104,14 @@ def main():
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
     # Load data
-    data_path = '/content/drive/MyDrive/AIfinal/validation.csv/validation.csv'
+    data_path1 = '/content/drive/MyDrive/AIfinal/validation.csv/validation.csv'
+    data_path2 = '/content/drive/MyDrive/AI-2024-final-project/validation.csv'
+    if os.path.exists(data_path1):
+        data_path = data_path1
+    elif os.path.exists(data_path2):
+        data_path = data_path2
+    else:
+        raise FileNotFoundError("Both data paths do not exist.")
     data = pd.read_csv(data_path)
     
     articles = data['article'].tolist()

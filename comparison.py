@@ -6,7 +6,7 @@ from rouge import Rouge
 import utils
 import pandas as pd
 import baseline_methods
-
+import os
 # Load the model and tokenizer
 tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
 model = GPT2LMHeadModel.from_pretrained('gpt2')
@@ -17,7 +17,14 @@ if tokenizer.pad_token is None:
 model.resize_token_embeddings(len(tokenizer))
 
 # Load the fine-tuned model
-model_path = '/content/drive/MyDrive/AIfinal/gpt2_finetuned.pth'
+model_path1 = '/content/drive/MyDrive/AIfinal/gpt2_finetuned.pth'
+model_path2 = '/content/drive/MyDrive/AI-2024-final-project/gpt2_finetuned.pth'
+if os.path.exists(model_path1):
+    model_path = model_path1
+elif os.path.exists(model_path2):
+    model_path = model_path2
+else:
+    raise FileNotFoundError("Both model paths do not exist.")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = utils.load_model(model, model_path, device)
 
@@ -124,7 +131,14 @@ def compare_results(data, baseline_results, num_samples):
 
 def main():
     # Load data
-    data_path = '/content/drive/MyDrive/AIfinal/validation.csv/validation.csv'
+    data_path1 = '/content/drive/MyDrive/AIfinal/validation.csv/validation.csv'
+    data_path2 = '/content/drive/MyDrive/AI-2024-final-project/validation.csv'
+    if os.path.exists(data_path1):
+        data_path = data_path1
+    elif os.path.exists(data_path2):
+        data_path = data_path2
+    else:
+        raise FileNotFoundError("Both data paths do not exist.")
     data = pd.read_csv(data_path)
     
     # Generate baseline results
