@@ -3,17 +3,17 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import GPT2Tokenizer, GPT2LMHeadModel
 from torch.nn.utils.rnn import pad_sequence
 import pandas as pd
-from preprocess import preprocessing_function
-from utils import save_model
+from preprocess import preprocessing_function  # Assuming this function exists
+from utils import save_model  # Assuming this function exists
 from torch.nn import CrossEntropyLoss
+from torch.cuda.amp import autocast, GradScaler
 
 class ArticleDataset(Dataset):
-    def __init__(self, articles, summaries, tokenizer, max_len=512, step=256):
+    def __init__(self, articles, summaries, tokenizer, max_len=512):
         self.tokenizer = tokenizer
         self.articles = articles
         self.summaries = summaries
         self.max_len = max_len
-        self.step = step
 
     def __len__(self):
         return len(self.articles)
@@ -22,128 +22,124 @@ class ArticleDataset(Dataset):
         article = self.articles[idx]
         summary = self.summaries[idx]
         processed_article = preprocessing_function(article)
-        processed_summary = preprocessing_function(summary)
-        article_tokens = self.tokenizer.encode(processed_article, return_tensors='pt').squeeze(0)
-        summary_tokens = self.tokenizer.encode(processed_summary, return_tensors='pt').squeeze(0)
+        article_tokens = self.tokenizer.encode(processed_article + " TL;DR:", return_tensors='pt').squeeze(0)
+
+        if len(article_tokens) > self.max_len:
+            article_tokens = article_tokens[:self.max_len]
+
+        summary_tokens = self.tokenizer.encode(summary, return_tensors='pt').squeeze(0)
         return article_tokens, summary_tokens
 
 def collate_fn(batch):
     articles, summaries = zip(*batch)
-    articles = pad_sequence(articles, batch_first=True, padding_value=50256)  # 50256 is GPT-2's pad token ID
+    articles = pad_sequence(articles, batch_first=True, padding_value=50256)
     summaries = pad_sequence(summaries, batch_first=True, padding_value=50256)
     return articles, summaries
 
-def generate_summary(article_tokens, model, tokenizer, device, max_new_tokens=20):
+def generate_summary(article_tokens, model, tokenizer, device, max_length=50, num_beams=3):
     model.eval()
-    input_length = article_tokens.size(1)
-    max_length = input_length + max_new_tokens
-    
-    if max_length > model.config.n_positions:
-        raise ValueError(f"Input length {input_length} plus max_new_tokens {max_new_tokens} exceeds model's maximum length {model.config.n_positions}")
-    
     with torch.no_grad():
         outputs = model.generate(
-            article_tokens.to(device), 
-            attention_mask=(article_tokens != tokenizer.pad_token_id).float().to(device), 
-            max_length=max_length
+            article_tokens.to(device),
+            attention_mask=(article_tokens != tokenizer.pad_token_id).float().to(device),
+            max_length=max_length,
+            num_beams=num_beams,
+            early_stopping=True,
+            no_repeat_ngram_size=2,
+            min_length=30
         )
     summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return summary
+    return summary.split(' TL;DR:')[-1].strip()
 
-def train_model(data_loader, tokenizer, model, device, optimizer, criterion, max_new_tokens=20):
+def sliding_window_processing(article_tokens, window_size=256, step_size=128):
+    chunks = []
+    for start in range(0, article_tokens.size(1), step_size):
+        end = min(start + window_size, article_tokens.size(1))
+        chunks.append(article_tokens[:, start:end])
+        if end == article_tokens.size(1):
+            break
+    return chunks
+
+def train_model(data_loader, tokenizer, model, device, optimizer, criterion, scaler, max_length=50, clip_value=1.0, window_size=256, step_size=128):
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 50256
     model.train()
     article_count = 0
-    for epoch in range(4):  # Adjust epochs as necessary
+    for epoch in range(4):
         for article_tokens, summary_tokens in data_loader:
+            article_count += len(article_tokens)
             article_tokens = article_tokens.to(device)
             summary_tokens = summary_tokens.to(device)
-            article_count += article_tokens.size(0)  # Increase the count by the batch size
 
-            # Prepare the inputs and labels
-            inputs = torch.cat((article_tokens, summary_tokens[:, :-1]), dim=1)
-            labels = torch.cat((torch.full_like(article_tokens, -100), summary_tokens[:, 1:]), dim=1)  # Mask the article part
+            if article_tokens.size(1) > model.config.n_positions:
+                article_chunks = sliding_window_processing(article_tokens, window_size, step_size)
+            else:
+                article_chunks = [article_tokens]
 
-            # Compute attention mask
-            attention_mask = (inputs != pad_token_id).float()
+            for chunk in article_chunks:
+                if chunk.size(1) > model.config.n_positions:
+                    chunk = chunk[:, :model.config.n_positions]
 
-            # Adjust the length to be within the model's limits
-            max_length = min(inputs.size(1), model.config.n_positions)
-            inputs = inputs[:, :max_length]
-            labels = labels[:, :max_length]
-            attention_mask = attention_mask[:, :max_length]
+                inputs = torch.cat((chunk, summary_tokens[:, :-1]), dim=1)
+                labels = torch.cat((torch.full_like(chunk, -100), summary_tokens[:, 1:]), dim=1)
 
-            # Forward pass
-            outputs = model(input_ids=inputs, attention_mask=attention_mask, labels=labels)
-            loss = criterion(outputs.logits.view(-1, model.config.vocab_size), labels.view(-1))
-            
-            # Backward pass
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
+                attention_mask = (inputs != pad_token_id).float()
+                max_length = min(inputs.size(1), model.config.n_positions)
+                inputs = inputs[:, :max_length]
+                labels = labels[:, :max_length]
+                attention_mask = attention_mask[:, :max_length]
 
-            # Print loss and article count
-            print(f"Epoch {epoch}, Loss: {loss.item()}")
-            print(f"Articles Processed: {article_count}")
+                with autocast():
+                    outputs = model(input_ids=inputs, attention_mask=attention_mask, labels=labels)
+                    loss = criterion(outputs.logits.reshape(-1, model.config.vocab_size), labels.reshape(-1))
 
-            try:
-                # Generate a summary for the current batch
-                generated_summary = generate_summary(article_tokens, model, tokenizer, device, max_new_tokens)
-                print(f"Generated Summary: {generated_summary}")
-            except ValueError as e:
-                print(f"Skipping summary generation: {e}")
-            print("-" * 80)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
 
-def save_model(model, path):
-    torch.save(model.state_dict(), path)
-    print(f"Model saved to {path}")
+                print(f"Epoch {epoch}, Loss: {loss.item()}, Articles Processed: {article_count}")
+
+                try:
+                    generated_summary = generate_summary(chunk, model, tokenizer, device, max_length)
+                    print(f"Generated Summary: {generated_summary}")
+                except ValueError as e:
+                    print(f"Skipping summary generation: {e}")
+                print("-" * 80)
+
+                # 显存释放
+                del inputs, labels, attention_mask, outputs, loss
+                torch.cuda.empty_cache()
 
 def main():
-    # Set CUDA_LAUNCH_BLOCKING environment variable
     import os
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
-    # Load data
-    data_path1 = '/content/drive/MyDrive/AIfinal/validation.csv/validation.csv'
-    data_path2 = '/content/drive/MyDrive/AI-2024-final-project/validation.csv'
-    if os.path.exists(data_path1):
-        data_path = data_path1
-    elif os.path.exists(data_path2):
-        data_path = data_path2
-    else:
-        raise FileNotFoundError("Both data paths do not exist.")
+    data_path = '/content/drive/MyDrive/AIfinal/validation.csv/validation.csv'
     data = pd.read_csv(data_path)
-    
+
     articles = data['article'].tolist()
     summaries = data['highlights'].tolist()
 
-    # Initialize tokenizer and model
     tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
     model = GPT2LMHeadModel.from_pretrained('gpt2')
 
-    # Resize token embeddings
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens({'pad_token': '[PAD]'})
     model.resize_token_embeddings(len(tokenizer))
 
-    # Move model to device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    # Prepare data loader
-    dataset = ArticleDataset(articles, summaries, tokenizer)
-    data_loader = DataLoader(dataset, batch_size=1, collate_fn=collate_fn, shuffle=True)
+    dataset = ArticleDataset(articles, summaries, tokenizer, max_len=1024)
+    data_loader = DataLoader(dataset, batch_size=2, collate_fn=collate_fn, shuffle=True)  # Reduced batch size
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
-    
-    # Criterion
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-6)
     criterion = CrossEntropyLoss(ignore_index=-100)
+    scaler = GradScaler()
 
-    # Train the model
-    train_model(data_loader, tokenizer, model, device, optimizer, criterion, max_new_tokens=20)
-
-    # Save the model
+    train_model(data_loader, tokenizer, model, device, optimizer, criterion, scaler, max_length=50)
     save_model(model, '/content/drive/MyDrive/AIfinal/gpt2_finetuned.pth')
 
 if __name__ == "__main__":
